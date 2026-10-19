@@ -2817,6 +2817,68 @@ int responseInt(RadioResponseInfo& responseInfo, int serial, int responseType, R
     return ret;
 }
 
+#ifndef RIL_CARD_MAX_APPS
+#define RIL_CARD_MAX_APPS 8
+#endif
+
+// The Samsung/Qualcomm vendor RIL (libsec-ril) returns a card status whose
+// per-app struct carries 5 extra ints after pin2 (52 bytes per app instead
+// of 32), so the whole struct is 440 bytes instead of 280 on 32-bit.
+typedef struct {
+    int   app_type;
+    int   app_state;
+    int   perso_substate;
+    char *aid_ptr;
+    char *app_label_ptr;
+    int   pin1_replaced;
+    int   pin1;
+    int   pin2;
+    int   pin1_num_retries;
+    int   puk1_num_retries;
+    int   pin2_num_retries;
+    int   puk2_num_retries;
+    int   perso_unblock_retries;
+} SecRilAppStatus;
+
+typedef struct {
+    int card_state;
+    int universal_pin_state;
+    int gsm_umts_subscription_app_index;
+    int cdma_subscription_app_index;
+    int ims_subscription_app_index;
+    int num_applications;
+    SecRilAppStatus applications[RIL_CARD_MAX_APPS];
+} SecRilCardStatus;
+
+static_assert(sizeof(char *) != 4 || sizeof(SecRilCardStatus) == 440,
+              "unexpected SecRilCardStatus size");
+
+template <typename CS>
+static void fillCardStatus(CardStatus &cardStatus, const CS *p_cur) {
+    cardStatus.cardState = (CardState) p_cur->card_state;
+    cardStatus.universalPinState = (PinState) p_cur->universal_pin_state;
+    cardStatus.gsmUmtsSubscriptionAppIndex = p_cur->gsm_umts_subscription_app_index;
+    cardStatus.cdmaSubscriptionAppIndex = p_cur->cdma_subscription_app_index;
+    cardStatus.imsSubscriptionAppIndex = p_cur->ims_subscription_app_index;
+
+    int numApps = p_cur->num_applications;
+    if (numApps < 0) numApps = 0;
+    if (numApps > RIL_CARD_MAX_APPS) numApps = RIL_CARD_MAX_APPS;
+    cardStatus.applications.resize(numApps);
+    AppStatus *appStatus = cardStatus.applications.data();
+    for (int i = 0; i < numApps; i++) {
+        const auto &a = p_cur->applications[i];
+        appStatus[i].appType = (AppType) a.app_type;
+        appStatus[i].appState = (AppState) a.app_state;
+        appStatus[i].persoSubstate = (PersoSubstate) a.perso_substate;
+        appStatus[i].aidPtr = convertCharPtrToHidlString(a.aid_ptr);
+        appStatus[i].appLabelPtr = convertCharPtrToHidlString(a.app_label_ptr);
+        appStatus[i].pin1Replaced = a.pin1_replaced;
+        appStatus[i].pin1 = (PinState) a.pin1;
+        appStatus[i].pin2 = (PinState) a.pin2;
+    }
+}
+
 int radio::getIccCardStatusResponse(int slotId,
                                    int responseType, int serial, RIL_Errno e,
                                    void *response, size_t responseLen) {
@@ -2824,34 +2886,14 @@ int radio::getIccCardStatusResponse(int slotId,
         RadioResponseInfo responseInfo = {};
         populateResponseInfo(responseInfo, serial, responseType, e);
         CardStatus cardStatus = {};
-        if (response == NULL || responseLen != sizeof(RIL_CardStatus_v6)) {
-            RLOGE("getIccCardStatusResponse: Invalid response");
-            if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
+        if (response != NULL && responseLen == sizeof(RIL_CardStatus_v6)) {
+            fillCardStatus(cardStatus, (const RIL_CardStatus_v6 *) response);
+        } else if (response != NULL && responseLen == sizeof(SecRilCardStatus)) {
+            fillCardStatus(cardStatus, (const SecRilCardStatus *) response);
         } else {
-            RIL_CardStatus_v6 *p_cur = ((RIL_CardStatus_v6 *) response);
-            cardStatus.cardState = (CardState) p_cur->card_state;
-            cardStatus.universalPinState = (PinState) p_cur->universal_pin_state;
-            cardStatus.gsmUmtsSubscriptionAppIndex = p_cur->gsm_umts_subscription_app_index;
-            cardStatus.cdmaSubscriptionAppIndex = p_cur->cdma_subscription_app_index;
-            cardStatus.imsSubscriptionAppIndex = p_cur->ims_subscription_app_index;
-
-            RIL_AppStatus *rilAppStatus = p_cur->applications;
-            cardStatus.applications.resize(p_cur->num_applications);
-            AppStatus *appStatus = cardStatus.applications.data();
-#if VDBG
-            RLOGD("getIccCardStatusResponse: num_applications %d", p_cur->num_applications);
-#endif
-            for (int i = 0; i < p_cur->num_applications; i++) {
-                appStatus[i].appType = (AppType) rilAppStatus[i].app_type;
-                appStatus[i].appState = (AppState) rilAppStatus[i].app_state;
-                appStatus[i].persoSubstate = (PersoSubstate) rilAppStatus[i].perso_substate;
-                appStatus[i].aidPtr = convertCharPtrToHidlString(rilAppStatus[i].aid_ptr);
-                appStatus[i].appLabelPtr = convertCharPtrToHidlString(
-                        rilAppStatus[i].app_label_ptr);
-                appStatus[i].pin1Replaced = rilAppStatus[i].pin1_replaced;
-                appStatus[i].pin1 = (PinState) rilAppStatus[i].pin1;
-                appStatus[i].pin2 = (PinState) rilAppStatus[i].pin2;
-            }
+            RLOGE("getIccCardStatusResponse: Invalid response (len=%zu, expected %zu or %zu)",
+                  responseLen, sizeof(RIL_CardStatus_v6), sizeof(SecRilCardStatus));
+            if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
         }
 
         Return<void> retStatus = radioService[slotId]->mRadioResponse->
